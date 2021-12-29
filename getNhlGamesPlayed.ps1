@@ -1,85 +1,97 @@
 <#
     .SYNOPSIS
-        A script that will return the number of games played by team in a specified
-        date range, potentially filtering out teams that did not meet a minimum
-        threshold for games played
+        Return game status counts and opponent info for each NHL team that meets the various configured requirements of the call        
     .DESCRIPTION
-        This script takes in 2 dates, a BeginDate, and an EndDate. 
-        If EndDate is not provided, it will default to the current date
-        If BeginDate is not provided, it will default to the current date
-        If an invalid date range is provided the program will swear at you
-
-        It then calls the various NHL API endpoints to determine the schedule for
-        all teams, and returns the number of games they will play in the specified
-        date range, inclusive of the 2 dates provided
+        This program makes 2 calls out to the NHL's API against the teams and schedule endpoints. It then processes the returned
+        data to present a table with at most one row per team showing the number of games by game status in the configured date
+        range, as well as which opponents the team is playing in that date range
     .EXAMPLE
-        .\Get-NHL-Schedule.ps1 -BeginDate 2021-10-17 -EndDate 2021-10-24 -Teams @("Vancouver Canucks", "Seattle Kraken") -MinGames 2       
-        Should return the team + number of games played by Vancouver and Seattle from October 17, 2021 through October 24, 2021, 
-        but only if they played 2 or more games
+        .\Get-NHL-Schedule.ps1 -BeginDate 2021-10-17 -EndDate 2021-10-24 -Teams @("Vancouver Canucks", "Seattle Kraken") -MinGames 2 -MaxGames 4 -GameStateFilter "Scheduled"       
+        Should return at most one row per team for Vancouver and Seattle but only if they have 2, 3, or 4 games between October 17th and October 24th (inclusive) that have
+        a game status of 'Scheduled' (that is, it is still scheduled to be played)
     .OUTPUTS
-        A list of Team_Name: Games_Played    
+        A formatted table with columns: Team, Total, Scheduled, Postponed, Final, Playing Against. 
+        Team lists the name of the team
+        Playing Against is an array of team names that Team is playing against in the date range
+        Total is the total games independent of status
+        Scheduled is games that are still scheduled to occur
+        Postponed are games that have been postponed
+        Final are games that have already been played
 #>
 
 # TODO:
 #   - [ ] Better response validation, don't just throw on non-200's
 #   - [ ] Implement partial name searching for teams (probably hard)
 #   - [ ] Better documentation
+#   - [ ] Parameterize game statuses?
 
 param (
-    [string]$BeginDate = (Get-Date -f yyyy-MM-dd),    
-    [string]$EndDate = (Get-Date -f yyyy-MM-dd),    
-    [string[]]$Teams,
+    [string]
+    # Show only games on or after this date. Example: 2021-10-31
+    $BeginDate = (Get-Date -f yyyy-MM-dd),
+
+    [string]
+    # Show only games on or before this date. Example: 2021-11-07
+    $EndDate = (Get-Date -f yyyy-MM-dd),
+    
+    [string[]]
+    # Only return results for the teams in this array. If left blank, all teams will be considered
+    $Teams,
+
+    [ValidateRange(0, 82)]
+    [int]
+    # Only return results for a team if they have at least this many games in the specified 'GameStateFilter' status
+    $MinGames = 0,
+
     [ValidateRange(1, 82)]
-    [int]$MinGames = 1,
-    [ValidateRange(1, 82)]
-    [int]$MaxGames = 82
+    [int]
+    # Only return results for a team if that have at most this many games in the specified 'GameStateFilter' status
+    $MaxGames = 82,
+
+    [string]
+    # Determines which games from the valid statuses ('Total', 'Scheduled', 'Postponed', 'Final') will be considered
+    # when filtering for MinGames and MaxGames
+    $GameStateFilter = "Total"
 )
 
 $statsApiBase = "https://statsapi.web.nhl.com/api/v1/"
 $teamsApi = "$($statsApiBase)teams/"
 $scheduleApi = "$($statsApiBase)schedule?"
 
-function Select-TeamGames {
-    # Validation
+function Select-TeamGames {    
     Assert-GoodDateRange
     Assert-GoodGameRange
     
     $ScheduleObj = (Get-Schedule).Content | ConvertFrom-Json
-
-    # Object looks like:
-    # dates
-    #   games
-    #       teams
-    #           away | home
-    #               team
-    #                   name
-
     $TeamsDict = @{}
     
     $ScheduleObj.dates.games | ForEach-Object -Process {
         $Status = $_.status
         $_.teams | ForEach-Object -Process {
-            Add-ToTeamsDictionary -TeamName $_.away.team.name -Status $Status.detailedState -Dictionary $TeamsDict;
-            Add-ToTeamsDictionary -TeamName $_.home.team.name -Status $Status.detailedState -Dictionary $TeamsDict;                
+            Add-ToTeamsDictionary -TeamName $_.away.team.name -Status $Status.detailedState -Dictionary $TeamsDict -PlayingAgainstTeamName $_.home.team.name;
+            Add-ToTeamsDictionary -TeamName $_.home.team.name -Status $Status.detailedState -Dictionary $TeamsDict -PlayingAgainstTeamName $_.away.team.name;
         }
     }
 
-    #$ScheduleObj.dates.games.teams | ForEach-Object -Process {
-    #    Add-ToTeamsDictionary -TeamName $_.away.team.name -Dictionary $TeamsDict;
-    #    Add-ToTeamsDictionary -TeamName $_.home.team.name -Dictionary $TeamsDict;
-    #}
-
     $TeamsDict = Remove-InvalidGamesPlayedTeams -TeamsDict $TeamsDict
 
-    return $TeamsDict
+    return $TeamsDict | Format-ResultData
+}
+
+function Format-ResultData {
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]                
+        [HashTable]$TeamsDict
+    )
+
+    # TODO: Parameterize the format?
+    return $TeamsDict.Values | ForEach-Object {new-object psobject -Property $_} | Sort-Object -Property Team | Format-Table @("Team", "Total", "Scheduled", "Postponed", "Final", "Playing Against")
 }
 
 function Remove-InvalidGamesPlayedTeams {
     param(
         [Hashtable]$TeamsDict
     )
-    
-    # TODO: Validate good games played range
 
     $TeamsDict = Remove-TeamsBelowGamesPlayedMin -TeamsDict $TeamsDict
     $TeamsDict = Remove-TeamsAboveGamesPlayedMax -TeamsDict $TeamsDict
@@ -91,14 +103,15 @@ function Remove-TeamsBelowGamesPlayedMin {
         [Hashtable]$TeamsDict
     )
     
-    # Schedule doesn't list teams that don't play games, so 1 is the minimum
-    if ($MinGames -eq 1){
+    # MinGames checks for 0 now, as it could be filtering against a status that has 0 such games (e.g. if 'Final' is chosen)
+    # when no games have been played in the date range yet
+    if ($MinGames -eq 0){
         return $TeamsDict
     }
 
     $AdjustedDict = @{}
     $TeamsDict.Keys | ForEach-Object -Process {
-        if (($TeamsDict[$_]['Total'] -gt $MinGames) -or ($TeamsDict[$_]['Total'] -eq $MinGames)){
+        if (($TeamsDict[$_][$GameStateFilter] -gt $MinGames) -or ($TeamsDict[$_][$GameStateFilter] -eq $MinGames)){
             $AdjustedDict[$_] = $TeamsDict[$_]
         }
     }
@@ -117,7 +130,7 @@ function Remove-TeamsAboveGamesPlayedMax {
 
     $AdjustedDict = @{}
     $TeamsDict.Keys | ForEach-Object -Process {
-        if (($TeamsDict[$_]['Total'] -lt $MaxGames) -or ($TeamsDict[$_]['Total'] -eq $MaxGames)){
+        if (($TeamsDict[$_][$GameStateFilter] -lt $MaxGames) -or ($TeamsDict[$_][$GameStateFilter] -eq $MaxGames)){
             $AdjustedDict[$_] = $TeamsDict[$_]
         }
     }
@@ -129,18 +142,20 @@ function Add-ToTeamsDictionary{
     param(        
         [string]$TeamName,     
         [string]$Status,   
-        [Hashtable]$Dictionary
+        [Hashtable]$Dictionary,
+        [string]$PlayingAgainstTeamName
     )
 
     if (($Teams.Count -eq 0) -or ($Teams.Contains($TeamName))){
         $GamesByStatusForTeam = $Dictionary[$TeamName]
 
         if ($null -eq $GamesByStatusForTeam){
-            $GamesByStatusForTeam = @{"Team"=$TeamName}
+            $GamesByStatusForTeam = @{"Team"=$TeamName; "Final"=0; "Scheduled"=0; "Postponed"=0; "Playing Against"=[System.Collections.ArrayList]@()}
         }
 
-        $GamesByStatusForTeam[$Status]++
 
+        $SwallowIndex = $GamesByStatusForTeam["Playing Against"].Add($PlayingAgainstTeamName)
+        $GamesByStatusForTeam[$Status]++        
         $GamesByStatusForTeam['Total']++
 
         $Dictionary[$TeamName] = $GamesByStatusForTeam
