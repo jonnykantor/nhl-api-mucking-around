@@ -4,7 +4,7 @@
     .DESCRIPTION
         This program makes 2 calls out to the NHL's API against the teams and schedule endpoints. It then processes the returned
         data to present a table with at most one row per team showing the number of games by game status in the configured date
-        range, as well as which opponents the team is playing in that date range
+        range, as well as which opponents the team is playing in that date range    
     .EXAMPLE
         .\Get-NHL-Schedule.ps1 -BeginDate 2021-10-17 -EndDate 2021-10-24 -Teams @("Vancouver Canucks", "Seattle Kraken") -MinGames 2 -MaxGames 4 -GameStateFilter "Scheduled"       
         Should return at most one row per team for Vancouver and Seattle but only if they have 2, 3, or 4 games between October 17th and October 24th (inclusive) that have
@@ -16,7 +16,7 @@
         Total is the total games independent of status
         Scheduled is games that are still scheduled to occur
         Postponed are games that have been postponed
-        Final are games that have already been played
+        Final are games that have already been played    
 #>
 
 # TODO:
